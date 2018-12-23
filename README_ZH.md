@@ -6,7 +6,7 @@
 [4]: https://github.com/zhaojh329/rtty/pulls
 [5]: https://img.shields.io/badge/Issues-welcome-brightgreen.svg?style=plastic
 [6]: https://github.com/zhaojh329/rtty/issues/new
-[7]: https://img.shields.io/badge/release-6.3.1-blue.svg?style=plastic
+[7]: https://img.shields.io/badge/release-6.4.1-blue.svg?style=plastic
 [8]: https://github.com/zhaojh329/rtty/releases
 [9]: https://travis-ci.org/zhaojh329/rtty.svg?branch=master
 [10]: https://travis-ci.org/zhaojh329/rtty
@@ -29,7 +29,7 @@
 [服务端]: https://github.com/zhaojh329/rttys
 
 ![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/screen.gif)
-![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/lrzsz.gif)
+![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/file.gif)
 
 它由客户端和[服务端]组成。客户端采用纯C实现。[服务端]采用GO语言实现，前端界面采用[iview]和[vue]实现。
 
@@ -42,7 +42,7 @@ rtty非常适合远程维护你的或者你公司的部署在全球各地的成�
 * 根据设备ID访问不同的设备
 * 提供dashboard，直观的展示在线设备
 * 基于[Xterm.js]的全功能终端
-* 支持使用[lrzsz]传输文件
+* 支持传输文件
 * 支持SSL: openssl, mbedtls, CyaSSl(wolfssl)
 * 支持远程执行命令
 * 客户端非常小，适合嵌入式Linux: rtty(20.1K) + libev(48.5K) + libuwsc(24.4K) + libwolfssl(595.9K) = 688.9K
@@ -92,6 +92,15 @@ rtty非常适合远程维护你的或者你公司的部署在全球各地的成�
 你可以非常方便的将RTTY嵌入到你现有的平台： `https://your-server-host:5912/#/?id=your-id`
 
 自动登录: `https://your-server:5912/#/?id=device-id&username=device-username&password=device-password`
+
+## 传输文件
+从本地传输文件到远程设备
+
+    rtty -R
+
+从远程设备传输文件到本地
+
+    rtty -S test.txt
 
 ## 远程执行命令
 ### Shell

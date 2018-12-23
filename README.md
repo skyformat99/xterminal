@@ -6,7 +6,7 @@
 [4]: https://github.com/zhaojh329/rtty/pulls
 [5]: https://img.shields.io/badge/Issues-welcome-brightgreen.svg?style=plastic
 [6]: https://github.com/zhaojh329/rtty/issues/new
-[7]: https://img.shields.io/badge/release-6.3.1-blue.svg?style=plastic
+[7]: https://img.shields.io/badge/release-6.4.1-blue.svg?style=plastic
 [8]: https://github.com/zhaojh329/rtty/releases
 [9]: https://travis-ci.org/zhaojh329/rtty.svg?branch=master
 [10]: https://travis-ci.org/zhaojh329/rtty
@@ -29,7 +29,7 @@
 [server]: https://github.com/zhaojh329/rttys
 
 ![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/screen.gif)
-![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/lrzsz.gif)
+![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/file.gif)
 
 It is composed of a client and a [server]. The client is written in pure C. The [server] is written in go language
 and the front-end interface is written in [iview] & [Vue].
@@ -45,12 +45,12 @@ the world.
 * Access different devices based on device ID
 * Provide a dashboard to visualize online devices
 * Fully-featured terminal based on [Xterm.js]
-* Support transfer file with [lrzsz]
+* Support transfer file
 * SSL support: openssl, mbedtls, CyaSSl(wolfssl)
 * Support Execute a command remote
 * The client is very small, suitable for embedded Linux: rtty(20.1K) + libev(48.5K) + libuwsc(24.4K) + libwolfssl(595.9K) = 688.9K
 
-# Dependencies for Client side
+# Dependencies of the Client side
 * [libev] - A full-featured and high-performance event loop
 * [libuwsc] - A Lightweight and fully asynchronous WebSocket client library based on libev
 * [mbedtls(polarssl)], [CyaSSl(wolfssl)] or [openssl] - If you want to support SSL
@@ -95,6 +95,15 @@ Use your web browser to access your server: `https://your-server-host:5912`, the
 You can easily embed RTTY into your existing platform: `https://your-server-host:5912/#/?id=your-id`
 
 Automatic login: `https://your-server:5912/#/?id=device-id&username=device-username&password=device-password`
+
+## Transfer file
+Transfer file from local to remote device
+
+	rtty -R
+
+Transfer file from remote device to the local
+
+	rtty -S test.txt
 
 ## Execute a command remote
 ### Shell

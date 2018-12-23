@@ -17,39 +17,30 @@
  * USA
  */
 
-#ifndef _COMMAND_H
-#define _COMMAND_H
+#ifndef _FILE_H
+#define _FILE_H
 
-#include <uwsc/uwsc.h>
+#include <uwsc/buffer.h>
+#include <ev.h>
 
-#include "json.h"
-
-#define RTTY_CMD_MAX_RUNNING     5
-#define RTTY_CMD_EXEC_TIMEOUT    5
+#define RF_BLK_SIZE 8912         /* 8KB */
 
 enum {
-	RTTY_CMD_ERR_PERMIT = 1,
-	RTTY_CMD_ERR_NOT_FOUND,
-	RTTY_CMD_ERR_NOMEM,
-	RTTY_CMD_ERR_SYSERR,
-	RTTY_CMD_ERR_RESP_TOOBIG
+    RF_SEND = 's',
+    RF_RECV = 'r'
 };
 
-struct task {
-    struct list_head list;
-    struct uwsc_client *ws;
-    struct ev_child cw;
-    struct ev_timer timer;
-    struct ev_io ioo;   /* Watch stdout of child */
-    struct ev_io ioe;   /* Watch stderr of child */
-    struct buffer ob;   /* buffer for stdout */
-    struct buffer eb;   /* buffer for stderr */
-    const json_value *msg;  /* message from server */
-    const json_value *attrs;
-    int id;
-    char cmd[0];
+struct transfer_context {
+    int size;
+    int offset;
+    int mode;
+    int fd;
+    char name[512];
+    ev_tstamp ts;
+    struct buffer b;
 };
 
-void run_command(struct uwsc_client *ws, const json_value *msg);
+void transfer_file(const char *name);
 
 #endif
+
