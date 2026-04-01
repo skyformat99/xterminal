@@ -1,46 +1,79 @@
 /*
- * Copyright (C) 2017 Jianhui Zhao <jianhuizhao329@gmail.com>
+ * MIT License
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
+ * Copyright (c) 2019 Jianhui Zhao <zhaojh329@gmail.com>
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
- * USA
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
-#ifndef _FILE_H
-#define _FILE_H
+#ifndef RTTY_FILE_H
+#define RTTY_FILE_H
 
-#include <uwsc/buffer.h>
 #include <ev.h>
 
-#define RF_BLK_SIZE 8912         /* 8KB */
+#include "buffer.h"
 
 enum {
-    RF_SEND = 's',
-    RF_RECV = 'r'
+    RTTY_FILE_MSG_SEND,
+    RTTY_FILE_MSG_RECV,
+    RTTY_FILE_MSG_INFO,
+    RTTY_FILE_MSG_DATA,
+    RTTY_FILE_MSG_ACK,
+    RTTY_FILE_MSG_ABORT
 };
 
-struct transfer_context {
-    int size;
-    int offset;
-    int mode;
+enum {
+    RTTY_FILE_CTL_REQUEST_ACCEPT,
+    RTTY_FILE_CTL_PROGRESS,
+    RTTY_FILE_CTL_INFO,
+    RTTY_FILE_CTL_BUSY,
+    RTTY_FILE_CTL_ABORT,
+    RTTY_FILE_CTL_NO_SPACE,
+    RTTY_FILE_CTL_ERR_EXIST,
+    RTTY_FILE_CTL_ERR
+};
+
+
+#define UPLOAD_FILE_BUF_SIZE (1024 * 63)
+
+struct file_control_msg {
+    int type;
+    uint8_t buf[128];
+};
+
+struct file_context {
     int fd;
-    char name[512];
-    ev_tstamp ts;
-    struct buffer b;
+    int ctlfd;
+    uid_t uid;
+    gid_t gid;
+    uint8_t *buf;
+    uint32_t total_size;
+    uint32_t remain_size;
 };
 
-void transfer_file(const char *name);
+void request_transfer_file(char type, const char *path);
+
+bool detect_file_operation(uint8_t *buf, int len, const char *sid, struct file_context *ctx);
+
+void parse_file_msg(struct file_context *ctx, struct buffer *data, int len);
+
+void file_context_reset(struct file_context *ctx);
 
 #endif
 

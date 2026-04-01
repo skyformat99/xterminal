@@ -22,26 +22,36 @@
  * SOFTWARE.
  */
 
-#ifndef _UTILS_H
-#define _UTILS_H
+#ifndef _WEB_H
+#define _WEB_H
 
-#include <stdbool.h>
-#include <sys/types.h>
+#include "rtty.h"
 
-int find_login(char *buf, int len);
+enum {
+    HTTP_CON_FLAG_HTTPS = 1 << 0,
+    HTTP_CON_FLAG_CONNECTING = 1 << 1,
+};
 
-bool valid_id(const char *id, size_t limit);
+struct http_connection {
+    struct list_head head;
+    struct rtty *rtty;
+    struct ev_timer tmr;
+    struct ev_io ior;
+    struct ev_io iow;
+    struct buffer rb;
+    struct buffer wb;
+    ev_tstamp active;
+    int sock;
+    uint8_t addr[18];   /* upstream connection address: [port ip] */
+    uint8_t flags;
+#ifdef SSL_SUPPORT
+    bool ssl_negotiated;
+    void *ssl;
+#endif
+};
 
-int b64_encode(const void *src, size_t srclen, void *dest, size_t destsize);
-
-const char *format_size(size_t size);
-
-struct mntent *find_mount_point(const char *name);
-
-ssize_t getcwd_by_pid(pid_t pid, char *buf, size_t bufsiz);
-
-bool getuid_by_pid(pid_t pid, uid_t *uid);
-
-bool getgid_by_pid(pid_t pid, gid_t *gid);
+void http_request(struct rtty *rtty, int len);
+void web_request_free(struct http_connection *ctx);
+void http_conns_free(struct list_head *reqs);
 
 #endif

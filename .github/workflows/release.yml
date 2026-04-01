@@ -1,0 +1,29 @@
+name: release
+
+on:
+  push:
+    tags:
+    - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - id: release-asset
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          mkdir rtty-$version
+          rsync -a . rtty-$version --exclude .git --exclude rtty-$version
+          tar zcfv rtty-$version.tar.gz rtty-$version
+          echo "filename=rtty-$version.tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ steps.release-asset.outputs.filename }}
+          draft: true

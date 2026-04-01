@@ -1,480 +1,708 @@
 /*
- * Copyright (C) 2017 Jianhui Zhao <jianhuizhao329@gmail.com>
+ * MIT License
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
+ * Copyright (c) 2019 Jianhui Zhao <zhaojh329@gmail.com>
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
- * USA
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
-#include <pty.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <dirent.h>
-#include <unistd.h>
-#include <stdint.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
-#include <uwsc/uwsc.h>
+#include <getopt.h>
+#include <time.h>
+#include <glob.h>
+#include <ini.h>
 
-#include "list.h"
-#include "file.h"
-#include "json.h"
-#include "config.h"
+#include "log/log.h"
 #include "utils.h"
-#include "command.h"
+#include "rtty.h"
 
-#define RTTY_RECONNECT_INTERVAL  5
-#define RTTY_MAX_SESSIONS        5
-#define RTTY_BUFFER_PERSISTENT_SIZE 4096
-
-struct tty_session {
-    pid_t pid;
-    int pty;
-    int sid;
-
-    struct ev_loop *loop;
-    struct ev_timer timer;
-    struct uwsc_client *cl;
-    struct ev_io ior;
-    struct ev_io iow;
-    struct ev_child cw;
-    struct buffer wb;
+enum {
+    LONG_OPT_CONFIG = 1,
+    LONG_OPT_HELP,
+    LONG_OPT_HTTP_TIMEOUT
 };
 
-static char login[128];       /* /bin/login */
-static char server_url[512];
-static bool auto_reconnect;
-static int keepalive = 5;       /* second */
-static struct ev_timer reconnect_timer;
-static struct tty_session *sessions[RTTY_MAX_SESSIONS + 1];
+struct config {
+    char *group;
+    char *devid;
+    char *host;
+    char *description;
+    char *token;
+    char *username;
+    int port;
+    int heartbeat;
+    int http_timeout;
+    bool has_port;
+    bool has_heartbeat;
+    bool has_http_timeout;
+    bool reconnect;
+    bool has_reconnect;
+    bool verbose;
+    bool has_verbose;
+    bool background;
+    bool has_background;
+#ifdef SSL_SUPPORT
+    bool ssl_on;
+    bool has_ssl_on;
+    bool insecure;
+    bool has_insecure;
+    char *cacert;
+    char *cert;
+    char *key;
+#endif
+};
 
-static void del_tty_session(struct tty_session *tty)
+static bool parse_bool(const char *s, bool *val)
 {
-    ev_io_stop(tty->loop, &tty->ior);
-    ev_io_stop(tty->loop, &tty->iow);
-    ev_timer_stop(tty->loop, &tty->timer);
-    ev_child_stop(tty->loop, &tty->cw);
-
-    buffer_free(&tty->wb);
-
-    close(tty->pty);
-    kill(tty->pid, SIGTERM);
-
-    sessions[tty->sid] = NULL;
-
-    uwsc_log_info("Del session: %d\n", tty->sid);
-
-    free(tty);
-}
-
-static inline struct tty_session *find_tty_session(int sid)
-{
-    if (sid > RTTY_MAX_SESSIONS)
-        return NULL;
-
-    return sessions[sid];
-}
-
-static inline void del_tty_session_by_sid(int sid)
-{
-    struct tty_session *tty = find_tty_session(sid);
-    if (tty)
-        del_tty_session(tty);
-}
-
-static void pty_read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
-{
-    struct tty_session *tty = container_of(w, struct tty_session, ior);
-    struct uwsc_client *cl = tty->cl;
-    static uint8_t buf[4096 + 1];
-    int len;
-
-    buf[0] = tty->sid;
-
-    while (1) {
-        len = read(w->fd, buf + 1, sizeof(buf) - 1);
-        if (likely(len > 0))
-            break;
-
-        if (len < 0) {
-            if (errno == EINTR)
-                continue;
-            if (errno != EIO)
-                uwsc_log_err("Read from pty failed: %s\n", strerror(errno));
-            return;
-        }
-
-        if (len == 0)
-            return;
+    if (!strcasecmp(s, "1") || !strcasecmp(s, "true") ||
+        !strcasecmp(s, "yes") || !strcasecmp(s, "on")) {
+        *val = true;
+        return true;
     }
 
-    cl->send(cl, buf, len + 1, UWSC_OP_BINARY);
-}
-
-static void pty_write_cb(struct ev_loop *loop, struct ev_io *w, int revents)
-{
-    struct tty_session *tty = container_of(w, struct tty_session, iow);
-    struct buffer *wb = &tty->wb;
-    int ret;
-
-    ret = buffer_pull_to_fd(wb, w->fd, buffer_length(wb), NULL, NULL);
-    if (ret < 0) {
-        uwsc_log_err("Write to pty failed: %s\n", strerror(errno));
-        return;
+    if (!strcasecmp(s, "0") || !strcasecmp(s, "false") ||
+        !strcasecmp(s, "no") || !strcasecmp(s, "off")) {
+        *val = false;
+        return true;
     }
 
-    if (buffer_length(wb) < 1)
-        ev_io_stop(loop, w);
+    return false;
 }
 
-static void pty_on_exit(struct ev_loop *loop, struct ev_child *w, int revents)
+static bool parse_int(const char *s, int *val)
 {
-    struct tty_session *tty = container_of(w, struct tty_session, cw);
-    char str[128] = "";
+    long v;
+    char *end;
 
-    snprintf(str, sizeof(str) - 1, "{\"type\":\"logout\",\"sid\":%d}", tty->sid);
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno || *end != '\0' || v < INT_MIN || v > INT_MAX)
+        return false;
 
-    tty->cl->send(tty->cl, str, strlen(str), UWSC_OP_TEXT);
-
-    del_tty_session(tty);
+    *val = (int)v;
+    return true;
 }
 
-static void new_tty_session(struct uwsc_client *cl, int sid)
+static bool replace_string(char **dst, const char *src)
 {
-    struct tty_session *s;
-    char str[128] = "";
-    pid_t pid;
-    int pty;
+    char *tmp = strdup(src);
+    if (!tmp)
+        return false;
 
-    s = calloc(1, sizeof(struct tty_session));
-    if (!s)
-        return;
-
-    pid = forkpty(&pty, NULL, NULL, NULL);
-    if (pid == 0)
-        execl(login, login, NULL);
-
-    s->cl = cl;
-    s->sid = sid;
-    s->pid = pid;
-    s->pty = pty;
-    s->loop = cl->loop;
-
-    fcntl(pty, F_SETFL, fcntl(pty, F_GETFL, 0) | O_NONBLOCK);
-
-    ev_io_init(&s->ior, pty_read_cb, pty, EV_READ);
-    ev_io_start(cl->loop, &s->ior);
-
-    ev_io_init(&s->iow, pty_write_cb, pty, EV_WRITE);
-
-    ev_child_init(&s->cw, pty_on_exit, pid, 0);
-    ev_child_start(cl->loop, &s->cw);
-
-    buffer_set_persistent_size(&s->wb, RTTY_BUFFER_PERSISTENT_SIZE);
-
-    sessions[sid] = s;
-
-    /* Notifying the user that the session was successfully created */
-    snprintf(str, sizeof(str) - 1, "{\"type\":\"login\",\"sid\":%d,\"code\":0}", sid);
-    cl->send(cl, str, strlen(str), UWSC_OP_TEXT);
-
-    uwsc_log_info("New session:%llu\n", sid);
+    free(*dst);
+    *dst = tmp;
+    return true;
 }
 
-static void change_winsize(int sid, int cols, int rows)
+static void free_config(struct config *cfg)
 {
-    struct tty_session *tty = find_tty_session(sid);
-    struct winsize size = {
-        .ws_col = cols,
-        .ws_row = rows
-    };
-
-    if(ioctl(tty->pty, TIOCSWINSZ, &size) < 0)
-        uwsc_log_err("ioctl TIOCSWINSZ error\n");
+    free(cfg->group);
+    free(cfg->devid);
+    free(cfg->host);
+    free(cfg->description);
+    free(cfg->token);
+    free(cfg->username);
+#ifdef SSL_SUPPORT
+    free(cfg->cacert);
+    free(cfg->cert);
+    free(cfg->key);
+#endif
 }
 
-static void uwsc_onmessage(struct uwsc_client *cl, void *data, size_t len, bool binary)
+static int apply_cfg_pair(struct config *cfg, const char *section,
+                          const char *key, const char *value)
 {
-    if (binary) {
-        int sid = (*(uint8_t *)data);
-        struct tty_session *tty = find_tty_session(sid);
+    int n;
+    bool b;
 
-        if (!tty) {
-            uwsc_log_err("non-existent sid: %d\n", sid);
-            return;
+    if (!strcmp(section, "rtty")) {
+        if (!strcmp(key, "group"))
+            return replace_string(&cfg->group, value) ? 0 : -1;
+
+        if (!strcmp(key, "id"))
+            return replace_string(&cfg->devid, value) ? 0 : -1;
+
+        if (!strcmp(key, "host"))
+            return replace_string(&cfg->host, value) ? 0 : -1;
+
+        if (!strcmp(key, "port")) {
+            if (!parse_int(value, &n))
+                goto bad_value;
+            cfg->port = n;
+            cfg->has_port = true;
+            return 0;
         }
 
-        buffer_put_data(&tty->wb, data + 1, len - 1);
-        ev_io_start(tty->loop, &tty->iow);
-        return;
-    } else {
-        const json_value *json;
-        const char *type;
-        int sid;
-       
-        json = json_parse((char *)data, len);
-        if (!json) {
-            uwsc_log_err("Invalid format: [%.*s]\n", len, (char *)data);
-            return;
+        if (!strcmp(key, "description"))
+            return replace_string(&cfg->description, value) ? 0 : -1;
+
+        if (!strcmp(key, "token"))
+            return replace_string(&cfg->token, value) ? 0 : -1;
+
+        if (!strcmp(key, "username"))
+            return replace_string(&cfg->username, value) ? 0 : -1;
+
+        if (!strcmp(key, "heartbeat")) {
+            if (!parse_int(value, &n))
+                goto bad_value;
+            cfg->heartbeat = n;
+            cfg->has_heartbeat = true;
+            return 0;
         }
 
-        type = json_get_string(json, "type");
-        if (!type || !type[0]) {
-            uwsc_log_err("Invalid format, not found type\n");
-            goto done;
+        if (!strcmp(key, "http-timeout")) {
+            if (!parse_int(value, &n))
+                goto bad_value;
+            cfg->http_timeout = n;
+            cfg->has_http_timeout = true;
+            return 0;
         }
 
-        sid = json_get_int(json, "sid");
-
-        if (!strcmp(type, "register")) {
-            uwsc_log_err("register failed: %s\n", json_get_string(json, "msg"));
-            ev_break(cl->loop, EVBREAK_ALL);
-        } else if (!strcmp(type, "login")) {
-            if (sid > RTTY_MAX_SESSIONS) {
-                char str[128] = "";
-                /* Notifies the user that the session creation failed  */
-                snprintf(str, sizeof(str) - 1, "{\"type\":\"login\",\"sid\":%d,\"err\":2,\"msg\":\"sessions is full\"}", sid);
-                cl->send(cl, str, strlen(str), UWSC_OP_TEXT);
-                uwsc_log_err("Can only run up to 5 sessions at the same time\n");
-                goto done;
-            }
-            new_tty_session(cl, sid);
-        } if (!strcmp(type, "logout")) {
-            del_tty_session_by_sid(sid);
-        } if (!strcmp(type, "cmd")) {
-            run_command(cl, json);
-            return;
-        } if (!strcmp(type, "winsize")) {
-            int cols = json_get_int(json, "cols");
-            int rows = json_get_int(json, "rows");
-            change_winsize(sid, cols, rows);
+        if (!strcmp(key, "reconnect")) {
+            if (!parse_bool(value, &b))
+                goto bad_value;
+            cfg->reconnect = b;
+            cfg->has_reconnect = true;
+            return 0;
         }
 
-done:
-        json_value_free((json_value *)json);
+        if (!strcmp(key, "verbose")) {
+            if (!parse_bool(value, &b))
+                goto bad_value;
+            cfg->verbose = b;
+            cfg->has_verbose = true;
+            return 0;
+        }
+
+        if (!strcmp(key, "background")) {
+            if (!parse_bool(value, &b))
+                goto bad_value;
+            cfg->background = b;
+            cfg->has_background = true;
+            return 0;
+        }
+    }
+
+#ifdef SSL_SUPPORT
+    if (!strcmp(section, "ssl")) {
+        if (!strcmp(key, "enabled")) {
+            if (!parse_bool(value, &b))
+                goto bad_value;
+            cfg->ssl_on = b;
+            cfg->has_ssl_on = true;
+            return 0;
+        }
+
+        if (!strcmp(key, "insecure")) {
+            if (!parse_bool(value, &b))
+                goto bad_value;
+            cfg->insecure = b;
+            cfg->has_insecure = true;
+            return 0;
+        }
+
+        if (!strcmp(key, "cacert"))
+            return replace_string(&cfg->cacert, value) ? 0 : -1;
+
+        if (!strcmp(key, "cert"))
+            return replace_string(&cfg->cert, value) ? 0 : -1;
+
+        if (!strcmp(key, "key"))
+            return replace_string(&cfg->key, value) ? 0 : -1;
+    }
+#endif
+
+    log_warn("unknown config key '%s' in section '%s'\n", key, section);
+    return 0;
+
+bad_value:
+    log_err("invalid value '%s' for key '%s' in section '%s'\n", value, key, section);
+    return -1;
+}
+
+static int inih_handler(void *user, const char *section, const char *name,
+                        const char *value)
+{
+    struct config *cfg = user;
+
+    if (apply_cfg_pair(cfg, section ? section : "", name, value) < 0)
+        return 0;
+
+    return 1;
+}
+
+static int load_config_file(const char *path, struct config *cfg)
+{
+    int ret = ini_parse(path, inih_handler, cfg);
+
+    if (ret == -1) {
+        log_err("open config file '%s' fail: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    if (ret > 0) {
+        log_err("parse config file '%s' fail at line %d\n", path, ret);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void clamp_heartbeat(int *heartbeat)
+{
+    if (*heartbeat < 5) {
+        *heartbeat = 5;
+        log_warn("Heartbeat interval too short, set to 5s\n");
+    }
+
+    if (*heartbeat > 255) {
+        *heartbeat = 255;
+        log_warn("Heartbeat interval too long, set to 255s\n");
     }
 }
 
-static void uwsc_onopen(struct uwsc_client *cl)
+static void clamp_http_timeout(int *http_timeout)
 {
-    uwsc_log_info("Connect to server succeed\n");
+    if (*http_timeout < 5) {
+        *http_timeout = 5;
+        log_warn("HTTP timeout too short, set to 5s\n");
+    }
+
+    if (*http_timeout > 255) {
+        *http_timeout = 255;
+        log_warn("HTTP timeout too long, set to 255s\n");
+    }
 }
 
-static void uwsc_onerror(struct uwsc_client *cl, int err, const char *msg)
+static int find_config_path(int argc, char **argv, const char **path)
 {
-    struct ev_loop *loop = cl->loop;
-
-    uwsc_log_err("onerror:%d: %s\n", err, msg);
-
-    free(cl);
-
-	if (auto_reconnect)
-        ev_timer_again(loop, &reconnect_timer);
-    else
-        ev_break(loop, EVBREAK_ALL);
-}
-
-static void uwsc_onclose(struct uwsc_client *cl, int code, const char *reason)
-{
-    struct ev_loop *loop = cl->loop;
     int i;
 
-    uwsc_log_err("onclose:%d: %s\n", code, reason);
+    *path = NULL;
 
-    for (i = 0; i < RTTY_MAX_SESSIONS + 1; i++)
-        if (sessions[i])
-            del_tty_session(sessions[i]);
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--conf")) {
+            if (i + 1 >= argc) {
+                log_err("option '%s' requires an argument\n", argv[i]);
+                return -1;
+            }
+            *path = argv[++i];
+            continue;
+        }
 
-    free(cl);
-
-    if (auto_reconnect)
-        ev_timer_again(loop, &reconnect_timer);
-    else
-        ev_break(loop, EVBREAK_ALL);
-}
-
-static void do_connect(struct ev_loop *loop, struct ev_timer *w, int revents)
-{
-    struct uwsc_client *cl = uwsc_new(loop, server_url, keepalive);
-    if (cl) {
-        cl->onopen = uwsc_onopen;
-        cl->onmessage = uwsc_onmessage;
-        cl->onerror = uwsc_onerror;
-        cl->onclose = uwsc_onclose;
-        ev_timer_stop(cl->loop, &reconnect_timer);
-        return;
+        if (!strncmp(argv[i], "--conf=", 7)) {
+            *path = argv[i] + 7;
+            continue;
+        }
     }
 
-    if (!auto_reconnect)
-        ev_break(loop, EVBREAK_ALL);
+    return 0;
 }
+
+static int apply_config_file(struct rtty *rtty, struct config *cfg)
+{
+    if (cfg->group) {
+        if (!valid_id(cfg->group, 16)) {
+            log_err("invalid group in config file\n");
+            return -1;
+        }
+        rtty->group = cfg->group;
+    }
+
+    if (cfg->devid) {
+        if (!valid_id(cfg->devid, 32)) {
+            log_err("invalid device id in config file\n");
+            return -1;
+        }
+        rtty->devid = cfg->devid;
+    }
+
+    if (cfg->host)
+        rtty->host = cfg->host;
+
+    if (cfg->has_port)
+        rtty->port = cfg->port;
+
+    if (cfg->description) {
+        if (strlen(cfg->description) > 126) {
+            log_err("Description too long in config file\n");
+            return -1;
+        }
+        rtty->description = cfg->description;
+    }
+
+    if (cfg->token)
+        rtty->token = cfg->token;
+
+    if (cfg->username)
+        rtty->username = cfg->username;
+
+    if (cfg->has_reconnect)
+        rtty->reconnect = cfg->reconnect;
+
+    if (cfg->has_heartbeat) {
+        rtty->heartbeat = cfg->heartbeat;
+        clamp_heartbeat(&rtty->heartbeat);
+    }
+
+    if (cfg->has_http_timeout) {
+        rtty->http_timeout = cfg->http_timeout;
+        clamp_http_timeout(&rtty->http_timeout);
+    }
+
+#ifdef SSL_SUPPORT
+    if (cfg->has_ssl_on)
+        rtty->ssl_on = cfg->ssl_on;
+
+    if (cfg->cacert) {
+        if (ssl_load_ca_cert_file(rtty->ssl_ctx, cfg->cacert)) {
+            log_err("load ca certificate file fail\n");
+            return -1;
+        }
+    }
+
+    if (cfg->has_insecure) {
+        rtty->insecure = cfg->insecure;
+        ssl_set_require_validation(rtty->ssl_ctx, !cfg->insecure);
+    }
+
+    if (cfg->cert) {
+        if (ssl_load_cert_file(rtty->ssl_ctx, cfg->cert)) {
+            log_err("load certificate file fail\n");
+            return -1;
+        }
+    }
+
+    if (cfg->key) {
+        if (ssl_load_key_file(rtty->ssl_ctx, cfg->key)) {
+            log_err("load private key file fail\n");
+            return -1;
+        }
+    }
+#endif
+
+    return 0;
+}
+
+#ifdef SSL_SUPPORT
+static void load_default_ca_cert(struct ssl_context *ctx)
+{
+	glob_t gl;
+	size_t i;
+
+	glob("/etc/ssl/certs/*.crt", 0, NULL, &gl);
+
+	for (i = 0; i < gl.gl_pathc; i++)
+		ssl_load_ca_cert_file(ctx, gl.gl_pathv[i]);
+
+	globfree(&gl);
+}
+#endif
 
 static void signal_cb(struct ev_loop *loop, ev_signal *w, int revents)
 {
+    struct rtty *rtty = ev_userdata(loop);
+
     if (w->signum == SIGINT) {
+        rtty->reconnect = false;
         ev_break(loop, EVBREAK_ALL);
-        uwsc_log_info("Normal quit\n");
+        log_info("Normal quit\n");
     }
 }
+
+static struct option long_options[] = {
+    {"conf",        required_argument, NULL, LONG_OPT_CONFIG},
+    {"group",       required_argument, NULL, 'g'},
+    {"id",          required_argument, NULL, 'I'},
+    {"host",        required_argument, NULL, 'h'},
+    {"port",        required_argument, NULL, 'p'},
+    {"description", required_argument, NULL, 'd'},
+    {"token",       required_argument, NULL, 't'},
+    {"http-timeout", required_argument, NULL, LONG_OPT_HTTP_TIMEOUT},
+#ifdef SSL_SUPPORT
+    {"cacert",      required_argument, NULL, 'C'},
+    {"insecure",    no_argument, NULL, 'x'},
+    {"cert",        required_argument, NULL, 'c'},
+    {"key",         required_argument, NULL, 'k'},
+#endif
+    {"verbose",     no_argument,       NULL, 'v'},
+    {"version",     no_argument,       NULL, 'V'},
+    {"help",        no_argument,       NULL, LONG_OPT_HELP},
+    {0, 0, 0, 0}
+};
 
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [option]\n"
-        "      -i ifname    # Network interface name - Using the MAC address of\n"
-        "                          the interface as the device ID\n"
-        "      -I id        # Set an ID for the device(Maximum 63 bytes, valid character:letters\n"
-        "                          and numbers and underlines and short lines) - If set,\n"
-        "                          it will cover the MAC address(if you have specify the ifname)\n"
-        "      -h host      # Server host\n"
-        "      -p port      # Server port\n"
-        "      -a           # Auto reconnect to the server\n"
-        "      -v           # verbose\n"
-        "      -d           # Adding a description to the device(Maximum 126 bytes)\n"
-        "      -s           # SSL on\n"
-        "      -k keepalive # keep alive in seconds for this client. Defaults to 5\n"
-        "      -V           # Show version\n"
-        "      -D           # Run in the background\n"
-        "      -R           # Receive file\n"
-        "      -S file      # Send file\n"
-        , prog);
+            "      --conf=file              Load options from INI config file\n"
+            "      -g, --group=string       Set a group for the device(max 16 chars, no spaces allowed)\n"
+            "      -I, --id=string          Set an ID for the device(max 32 chars, no spaces allowed)\n"
+            "      -h, --host=string        Server's host or ipaddr(Default is localhost)\n"
+            "      -p, --port=number        Server port(Default is 5912)\n"
+            "      -d, --description=string Add a description to the device(Maximum 126 bytes)\n"
+            "      -a                       Auto reconnect to the server\n"
+            "      -i number                Set heartbeat interval in seconds(Default is 30s)\n"
+            "      --http-timeout=number    Set HTTP idle timeout in seconds(Default is 30s)\n"
+#ifdef SSL_SUPPORT
+            "      -s                       SSL on\n"
+            "      -C, --cacert             CA certificate to verify peer against\n"
+            "      -x, --insecure           Allow insecure server connections when using SSL\n"
+            "      -c, --cert               Certificate file to use\n"
+            "      -k, --key                Private key file to use\n"
+#endif
+            "      -D                       Run in the background\n"
+            "      -t, --token=string       Authorization token\n"
+            "      -f username              Skip a second login authentication. See man login(1) about the details\n"
+            "      -R                       Receive file\n"
+            "      -S file                  Send file\n"
+            "      -v, --verbose            verbose\n"
+            "      -V, --version            Show version\n"
+            "      --help                   Show usage\n",
+            prog);
     exit(1);
 }
 
 int main(int argc, char **argv)
 {
-    int opt;
+#ifdef SSL_SUPPORT
+#define SSL_SHORTOPTS "sC:xc:k:"
+#else
+#define SSL_SHORTOPTS ""
+#endif
+
+    const char *shortopts = "g:I:i:h:p:d:aDt:f:RS:vV"SSL_SHORTOPTS;
     struct ev_loop *loop = EV_DEFAULT;
     struct ev_signal signal_watcher;
-    char mac[13] = "";
-    char devid[64] = "";
-    const char *host = NULL;
-    int port = 0;
-    char *description = NULL;
     bool background = false;
     bool verbose = false;
-    bool ssl = false;
+    const char *conf_path;
+    struct config cfg = {};
+    struct rtty rtty = {
+        .heartbeat = 30,
+        .http_timeout = 30,
+        .host = "localhost",
+        .port = 5912,
+        .loop = loop,
+        .sock = -1
+    };
+#ifdef SSL_SUPPORT
+    bool has_cacert = false;
+#endif
+    int option_index;
+    int ret = 0;
 
-    while ((opt = getopt(argc, argv, "i:h:p:I:avd:sk:VDRS:")) != -1) {
-        switch (opt)
-        {
-        case 'i':
-            if (get_iface_mac(optarg, mac, sizeof(mac)) < 0) {
-                return -1;
+#ifdef SSL_SUPPORT
+    rtty.ssl_ctx = ssl_context_new(false);
+    if (!rtty.ssl_ctx)
+        return -1;
+#endif
+
+    ev_set_userdata(loop, &rtty);
+
+    if (find_config_path(argc, argv, &conf_path)) {
+        ret = -1;
+        goto clean;
+    }
+
+    if (conf_path) {
+        if (load_config_file(conf_path, &cfg)) {
+            ret = -1;
+            goto clean;
+        }
+
+        if (apply_config_file(&rtty, &cfg)) {
+            ret = -1;
+            goto clean;
+        }
+
+#ifdef SSL_SUPPORT
+        has_cacert = cfg.cacert != NULL;
+#endif
+        verbose = cfg.has_verbose ? cfg.verbose : false;
+        background = cfg.has_background ? cfg.background : false;
+    }
+
+    while (true) {
+        int c = getopt_long(argc, argv, shortopts, long_options, &option_index);
+        if (c == -1)
+            break;
+
+        switch (c) {
+        case 'g':
+            if (!valid_id(optarg, 16)) {
+                log_err("invalid group\n");
+                ret = -1;
+                goto clean;
             }
-            break;
-        case 'h':
-            host = optarg;
-            break;
-        case 'p':
-            port = atoi(optarg);
+            rtty.group = optarg;
             break;
         case 'I':
-            strncpy(devid, optarg, sizeof(devid) - 1);
+            if (!valid_id(optarg, 32)) {
+                log_err("invalid device id\n");
+                ret = -1;
+                goto clean;
+            }
+            rtty.devid = optarg;
             break;
-        case 'a':
-            auto_reconnect = true;
+        case 'i':
+            rtty.heartbeat = atoi(optarg);
+            clamp_heartbeat(&rtty.heartbeat);
             break;
-        case 'v':
-            verbose = true;
+        case LONG_OPT_HTTP_TIMEOUT:
+            rtty.http_timeout = atoi(optarg);
+            clamp_http_timeout(&rtty.http_timeout);
+            break;
+        case 'h':
+            rtty.host = optarg;
+            break;
+        case 'p':
+            rtty.port = atoi(optarg);
             break;
         case 'd':
             if (strlen(optarg) > 126) {
-                uwsc_log_err("Description too long\n");
+                log_err("Description too long\n");
                 usage(argv[0]);
             }
-            description = calloc(1, strlen(optarg) * 4);
-            if (!description) {
-                uwsc_log_err("malloc failed:%s\n", strerror(errno));
-                exit(1);
-            }
-            urlencode(description, strlen(optarg) * 4, optarg, strlen(optarg));
+            rtty.description = optarg;
             break;
+        case 'a':
+            rtty.reconnect = true;
+            break;
+#ifdef SSL_SUPPORT
         case 's':
-            ssl = true;
+            rtty.ssl_on = true;
+            break;
+        case 'C':
+            if (ssl_load_ca_cert_file(rtty.ssl_ctx, optarg)) {
+                log_err("load ca certificate file fail\n");
+                ret = -1;
+                goto clean;
+            }
+            has_cacert = true;
+            break;
+        case 'x':
+            rtty.insecure = true;
+            ssl_set_require_validation(rtty.ssl_ctx, false);
+            break;
+        case 'c':
+            if (ssl_load_cert_file(rtty.ssl_ctx, optarg)) {
+                log_err("load certificate file fail\n");
+                ret = -1;
+                goto clean;
+            }
             break;
         case 'k':
-            keepalive = atoi(optarg);
+            if (ssl_load_key_file(rtty.ssl_ctx, optarg)) {
+                log_err("load private key file fail\n");
+                ret = -1;
+                goto clean;
+            }
             break;
-        case 'V':
-            uwsc_log_info("rtty version %s\n", RTTY_VERSION_STRING);
-            exit(0);
-            break;
+#endif
         case 'D':
             background = true;
             break;
-        case 'R':
-            transfer_file(NULL);
+        case LONG_OPT_CONFIG:
+             /* already loaded config file, ignore */
             break;
+        case 't':
+            rtty.token = optarg;
+            break;
+        case 'f':
+            rtty.username = optarg;
+            break;
+        case 'R':
+            request_transfer_file('R', NULL);
+            return 0;
         case 'S':
-            transfer_file(optarg);
+            request_transfer_file('S', optarg);
+            return 0;
+        case 'v':
+            verbose = true;
+            break;
+        case 'V':
+            log_info("rtty version %s\n", RTTY_VERSION_STRING);
+            exit(0);
+        case LONG_OPT_HELP:
+            usage(argv[0]);
             break;
         default: /* '?' */
             usage(argv[0]);
+            break;
         }
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+
+    if (!rtty.devid) {
+        log_err("you must specify an id for your device\n");
+        ret = -1;
+        goto clean;
+    }
+
+    if (find_login(rtty.login_path, sizeof(rtty.login_path) - 1) < 0) {
+        log_err("the program 'login' is not found\n");
+        ret = -1;
+        goto clean;
+    }
+
+    if (getuid() > 0) {
+        log_err("Operation not permitted, must be run as root\n");
+        ret = -1;
+        goto clean;
     }
 
     if (background && daemon(0, 0))
-        uwsc_log_err("Can't run in the background: %s\n", strerror(errno));
+        log_err("Can't run in the background: %s\n", strerror(errno));
 
-    if (!verbose)
-        uwsc_log_threshold(LOG_ERR);
+    if (verbose)
+        log_level(LOG_DEBUG);
 
-    if (!devid[0]) {
-        if (!mac[0]) {
-            uwsc_log_err("You must specify the ifname or id\n");
-            usage(argv[0]);
-        }
-        strcpy(devid, mac);
-    }
-
-    if (!valid_id(devid)) {
-        uwsc_log_err("Invalid device id\n");
-        usage(argv[0]);
-    }
-
-    if (!host || !port) {
-        uwsc_log_err("You must specify the host and port\n");
-        usage(argv[0]);
-    }
-
-    uwsc_log_info("libuwsc version %s\n", UWSC_VERSION_STRING);
-    uwsc_log_info("rtty version %s\n", RTTY_VERSION_STRING);
-
-    if (getuid() > 0) {
-        uwsc_log_err("Operation not permitted\n");
-        return -1;
-    }
-
-    if (find_login(login, sizeof(login) - 1) < 0) {
-        uwsc_log_err("The program 'login' is not found\n");
-        return -1;
-    }
-
-    snprintf(server_url, sizeof(server_url),
-        "ws%s://%s:%d/ws?device=1&devid=%s&description=%s&keepalive=%d",
-        ssl ? "s" : "", host, port, devid, description ? description : "", keepalive);
-    free(description);
-
-    ev_timer_init(&reconnect_timer, do_connect, 0.0, RTTY_RECONNECT_INTERVAL);
-	ev_timer_start(loop, &reconnect_timer);
+    log_info("rtty version %s\n", RTTY_VERSION_STRING);
 
     ev_signal_init(&signal_watcher, signal_cb, SIGINT);
     ev_signal_start(loop, &signal_watcher);
 
+#ifdef SSL_SUPPORT
+    if (rtty.ssl_ctx && !has_cacert)
+        load_default_ca_cert(rtty.ssl_ctx);
+#endif
+
+    srand(time(NULL));
+
+    if (rtty_start(&rtty) < 0)
+        goto clean;
+
     ev_run(loop, 0);
-    
-    return 0;
+
+    rtty_exit(&rtty);
+
+clean:
+#ifdef SSL_SUPPORT
+    ssl_context_free(rtty.ssl_ctx);
+#endif
+
+    free_config(&cfg);
+
+    ev_loop_destroy(loop);
+
+    return ret;
 }

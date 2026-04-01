@@ -1,294 +1,431 @@
 /*
- * Copyright (C) 2017 Jianhui Zhao <jianhuizhao329@gmail.com>
+ * MIT License
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
+ * Copyright (c) 2019 Jianhui Zhao <zhaojh329@gmail.com>
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
- * USA
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
-#include <errno.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
-#include <termios.h>
-#include <stdbool.h>
-#include <arpa/inet.h>
-#include <uwsc/log.h>
+#include <mntent.h>
+#include <inttypes.h>
+#include <libgen.h>
+#include <sys/statvfs.h>
+#include <linux/limits.h>
+#include <sys/sysinfo.h>
 
+#include "log/log.h"
 #include "file.h"
+#include "list.h"
+#include "rtty.h"
+#include "utils.h"
 
-static void set_stdin(bool raw)
+static uint8_t RTTY_FILE_MAGIC[] = {0xb6, 0xbc, 0xbd};
+static char savepath[PATH_MAX];
+
+static int send_file_control_msg(int fd, int type, void *buf, int len)
 {
-    static struct termios ots;
-    static bool current_raw;
-    struct termios nts;
+    struct file_control_msg msg = {
+        .type = type
+    };
 
-    if (raw) {
-        if (current_raw)
-            return;
+    if (len > sizeof(msg.buf)) {
+        len = sizeof(msg.buf);
+        log_err("file control msg too long\n");
+    }
 
-        current_raw = true;
+    if (buf)
+        memcpy(msg.buf, buf, len);
 
-        tcgetattr(STDIN_FILENO, &ots);
+    if (write(fd, &msg, sizeof(msg)) < 0)
+        return -1;
 
-        nts = ots;
+    return 0;
+}
 
-        nts.c_iflag = IGNBRK;
-        /* No echo, crlf mapping, INTR, QUIT, delays, no erase/kill */
-        nts.c_lflag &= ~(ECHO | ICANON | ISIG);
-        nts.c_oflag = 0;
-        nts.c_cc[VMIN] = 1;
-        nts.c_cc[VTIME] = 1;
-        tcsetattr(STDIN_FILENO, TCSADRAIN, &nts);
-        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK);
-    } else {
-        if (!current_raw)
-            return;
-        current_raw = false;
-        tcsetattr(STDIN_FILENO, TCSADRAIN, &ots);
-        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) & ~O_NONBLOCK);
+void file_context_reset(struct file_context *ctx)
+{
+    if (ctx->fd > -1) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+
+    if (ctx->ctlfd > -1) {
+        close(ctx->ctlfd);
+        ctx->ctlfd = -1;
+    }
+
+    if (ctx->buf) {
+        free(ctx->buf);
+        ctx->buf = NULL;
     }
 }
 
-static void rf_write(int fd, void *buf, int len)
+static void notify_user_canceled(struct tty *tty)
 {
-    if (write(fd, buf, len) < 0) {
-        uwsc_log_err("Write failed: %s\n", strerror(errno));
-        exit(0);
+    struct rtty *rtty = tty->rtty;
+
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 33);
+    buffer_put_data(&rtty->wb, tty->sid, 32);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_ABORT);
+    ev_io_start(rtty->loop, &rtty->iow);
+}
+
+static int notify_progress(struct file_context *ctx)
+{
+    if (send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_PROGRESS, &ctx->remain_size, 4) < 0)
+        return -1;
+
+    return 0;
+}
+
+static void send_file_data(struct file_context *ctx)
+{
+    struct tty *tty = container_of(ctx, struct tty, file);
+    struct rtty *rtty = tty->rtty;
+    int ret;
+
+    if (!ctx->buf) {
+        ctx->buf = malloc(UPLOAD_FILE_BUF_SIZE);
+        if (!ctx->buf) {
+            log_err("malloc: %s\n", strerror(errno));
+            send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_ERR, NULL, 0);
+            goto err;
+        }
     }
+
+    if (ctx->fd < 0)
+        return;
+
+    ret = read(ctx->fd, ctx->buf, UPLOAD_FILE_BUF_SIZE);
+    if (ret < 0) {
+        send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_ERR, NULL, 0);
+        goto err;
+    }
+
+    ctx->remain_size -= ret;
+
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 33 + ret);
+    buffer_put_data(&rtty->wb, tty->sid, 32);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_DATA);
+    buffer_put_data(&rtty->wb, ctx->buf, ret);
+    ev_io_start(rtty->loop, &rtty->iow);
+
+    if (ret == 0) {
+        file_context_reset(ctx);
+        return;
+    }
+
+    if (notify_progress(ctx) < 0)
+        goto err;
+
+    return;
+
+err:
+    notify_user_canceled(tty);
+    file_context_reset(ctx);
 }
 
-static bool parse_file_info(struct transfer_context *tc)
+static int start_upload_file(struct file_context *ctx, const char *path)
 {
-    struct buffer *b = &tc->b;
-    int len;
+    struct tty *tty = container_of(ctx, struct tty, file);
+    struct rtty *rtty = tty->rtty;
+    const char *name;
+    struct stat st;
+    int fd;
+    char *dirc;
 
-    if (buffer_length(b) < 3)
-        return false;
+    dirc = strdup(path);
+    name = basename(dirc);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        log_err("open '%s' fail: %s\n", path, strerror(errno));
+        free(dirc);
+        return -1;
+    }
 
-    len = buffer_get_u8(b, 1);
+    fstat(fd, &st);
 
-    if (buffer_length(b) < len + 2)
-        return false;
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 33 + strlen(name));
+    buffer_put_data(&rtty->wb, tty->sid, 32);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_SEND);
+    buffer_put_string(&rtty->wb, name);
+    ev_io_start(rtty->loop, &rtty->iow);
 
-    buffer_pull(b, NULL, 2);
-    buffer_pull(b, tc->name, len);
+    ctx->fd = fd;
+    ctx->total_size = st.st_size;
+    ctx->remain_size = st.st_size;
 
-    tc->size = ntohl(buffer_pull_u32(b));
+    log_info("upload file: %s, size: %" PRIu64 "\n", path, (uint64_t)st.st_size);
+    free(dirc);
 
-    return true;
+    return 0;
 }
 
-static bool parse_file_data(struct transfer_context *tc)
+bool detect_file_operation(uint8_t *buf, int len, const char *sid, struct file_context *ctx)
 {
-    struct buffer *b = &tc->b;
-    ev_tstamp n = ev_time();
-    char unit = 'K';
-    float offset;
-    int len;
+    struct tty *tty = container_of(ctx, struct tty, file);
+    struct rtty *rtty = tty->rtty;
+    char fifo_name[128];
+    pid_t pid;
+    int ctlfd;
+    uid_t uid;
+    gid_t gid;
 
-    if (buffer_length(b) < 3)
+    if (len != 12)
         return false;
 
-    len = ntohs(buffer_get_u16(b, 1));
-
-    if (buffer_length(b) < len + 3)
+    if (memcmp(buf, RTTY_FILE_MAGIC, 3))
         return false;
 
-    buffer_pull(b, NULL, 3);
+    memcpy(&pid, buf + 4, 4);
 
-    if (tc->fd > 0) {
-        buffer_pull_to_fd(b, tc->fd, len, NULL, NULL);
-    } else {
-        /* skip */
-        buffer_pull(b, NULL, len);
+    if (!getuid_by_pid(pid, &uid)) {
+        kill(pid, SIGTERM);
         return true;
     }
 
-    tc->offset += len;
-    offset = tc->offset / 1024.0;
-
-    if ((int)offset / 1024 > 0) {
-        offset = offset / 1024;
-        unit = 'M';
+    if (!getgid_by_pid(pid, &gid)) {
+        kill(pid, SIGTERM);
+        return true;
     }
 
-    printf("  %d%%   %.3f %cB    %.3fs\r",
-        (int)(tc->offset * 1.0 / tc->size * 100), offset, unit, n - tc->ts);
-    fflush(stdout);
+    sprintf(fifo_name, "/tmp/rtty-file-%d.fifo", pid);
+
+    ctlfd = open(fifo_name, O_WRONLY);
+    if (ctlfd < 0) {
+        log_err("Could not open fifo %s\n", fifo_name);
+        kill(pid, SIGTERM);
+        return true;
+    }
+
+    if (ctx->ctlfd > -1) {
+        send_file_control_msg(ctlfd, RTTY_FILE_CTL_BUSY, NULL, 0);
+        close(ctlfd);
+
+        return true;
+    }
+
+    if (buf[3] == 'R') {
+        buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+        buffer_put_u16be(&rtty->wb, 33);
+        buffer_put_data(&rtty->wb, tty->sid, 32);
+        buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_RECV);
+        ev_io_start(rtty->loop, &rtty->iow);
+
+        send_file_control_msg(ctlfd, RTTY_FILE_CTL_REQUEST_ACCEPT, NULL, 0);
+
+        memset(savepath, 0, sizeof(savepath));
+        getcwd_by_pid(pid, savepath, sizeof(savepath) - 1);
+        strcat(savepath, "/");
+
+        ctx->uid = uid;
+        ctx->gid = gid;
+    } else {
+        char path[PATH_MAX] = "";
+        char link[128];
+        int fd;
+
+        memcpy(&fd, buf + 8, 4);
+
+        sprintf(link, "/proc/%d/fd/%d", pid, fd);
+
+        if (readlink(link, path, sizeof(path) - 1) < 0) {
+            log_err("readlink: %s\n", strerror(errno));
+
+            send_file_control_msg(ctlfd, RTTY_FILE_CTL_ERR, NULL, 0);
+            close(ctlfd);
+
+            return true;
+        }
+
+        send_file_control_msg(ctlfd, RTTY_FILE_CTL_REQUEST_ACCEPT, NULL, 0);
+
+        if (start_upload_file(ctx, path) < 0) {
+            send_file_control_msg(ctlfd, RTTY_FILE_CTL_ERR, NULL, 0);
+            close(ctlfd);
+
+            return true;
+        }
+    }
+
+    ctx->ctlfd = ctlfd;
 
     return true;
 }
 
-static int parse_file(struct transfer_context *tc)
+static void start_download_file(struct file_context *ctx, struct buffer *info, int len)
 {
-    struct buffer *b = &tc->b;
-    int type;
+    char *name = savepath + strlen(savepath);
+    struct mntent *ment;
+    struct statvfs sfs;
+    char buf[512];
+    int fd;
 
-    while (buffer_length(b) > 0) {
-        type = buffer_get_u8(b, 0);
-
-        switch (type) {
-        case 0x01:  /* file info */
-            if (!parse_file_info(tc))
-                return false;
-
-            tc->ts = ev_time();
-
-            printf("Transferring '%s'...\r\n", tc->name);
-
-            tc->fd = open(tc->name, O_WRONLY | O_TRUNC | O_CREAT, 0644);
-            if (tc->fd < 0) {
-                char magic_err[] = {0xB6, 0xBC, 'e'};
-                printf("Create '%s' failed: %s\r\n", tc->name, strerror(errno));
-
-                usleep(1000);
-
-                rf_write(STDOUT_FILENO, magic_err, 3);
-            }
-
-            break;
-        case 0x02:  /* file data */
-            if (!parse_file_data(tc))
-                return false;
-            break;
-        case 0x03:  /* file eof */
-            if (tc->fd > 0) {
-                close(tc->fd);
-                tc->fd = -1;
-
-                if (tc->mode == RF_RECV)
-                    printf("\r\n");
-            }
-            return true;
-        default:
-            printf("error type\r\n");
-            exit(1);
-        }
-    }
-
-    return false;
-}
-
-static void stdin_read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
-{
-    struct transfer_context *tc = w->data;
-    bool eof = false;
-
-    buffer_put_fd(&tc->b, w->fd, -1, &eof, NULL, NULL);
-
-    if (parse_file(tc))
-        ev_io_stop(loop, w);
-}
-
-static void timer_cb(struct ev_loop *loop, ev_timer *w, int revents)
-{
-    struct transfer_context *tc = w->data;
-    static uint8_t buf[RF_BLK_SIZE + 3];
-    int len;
-
-    /* Canceled by user */
-    if (tc->fd < 0) {
-        buf[0] = 0x03;
-        rf_write(STDOUT_FILENO, buf, 1);
-        ev_break(loop, EVBREAK_ALL);
+    if (ctx->ctlfd < 0) {
+        buffer_pull(info, NULL, len);
         return;
     }
 
-    len = read(tc->fd, buf + 3, RF_BLK_SIZE);
-    if (len == 0) {
-        buf[0] = 0x03;
-        rf_write(STDOUT_FILENO, buf, 1);
-        ev_break(loop, EVBREAK_ALL);
-        return;
-    }
+    ctx->total_size = ctx->remain_size = buffer_pull_u32be(info);
 
-    buf[0] = 0x02;
-    *(uint16_t *)&buf[1] = htons(len);
-    
-    rf_write(STDOUT_FILENO, buf, len + 3);
-}
+    ment = find_mount_point(savepath);
+    if (ment) {
+        uint64_t avail;
 
-void transfer_file(const char *name)
-{
-    struct ev_loop *loop = EV_DEFAULT;
-    char magic[3] = {0xB6, 0xBC};
-    struct transfer_context tc = {};
-    const char *bname = "";
-    struct ev_timer t;
-    struct ev_io w;
+        if (!strcmp(ment->mnt_type, "ramfs")) {
+            struct sysinfo si;
 
-    if (name) {
-        struct stat st;
-
-        bname = basename(name);
-        magic[2] = tc.mode = RF_SEND;
-
-        printf("Transferring '%s'...Press Ctrl+C to cancel\r\n", bname);
-
-        tc.fd = open(name, O_RDONLY);
-        if (tc.fd < 0) {
-            if (errno == ENOENT) {
-                printf("Open '%s' failed: No such file\r\n", name);
-                exit(0);
+            if (sysinfo(&si)) {
+                log_err("download file fail: '%s'\n", strerror(errno));
+                goto check_space_fail;
             }
 
-            printf("Open '%s' failed: %s\r\n", name, strerror(errno));
-            exit(0);
+            avail = si.freeram;
+        } else if (!statvfs(ment->mnt_dir, &sfs)) {
+            avail = sfs.f_bavail * sfs.f_frsize;
+        } else {
+            log_err("download file fail: '%s'\n", strerror(errno));
+            goto check_space_fail;
         }
 
-        fstat(tc.fd, &st);
-        tc.size = st.st_size;
-
-        if (!(st.st_mode & S_IFREG)) {
-            printf("'%s' is not a regular file\r\n", name);
-            exit(0);
+        if (ctx->total_size > avail) {
+            log_err("download file fail: no enough space\n");
+            goto check_space_fail;
         }
     } else {
-        magic[2] = tc.mode = RF_RECV;
+        uint64_t avail;
+        
+        if (!statvfs(savepath, &sfs)) {
+            avail = sfs.f_bavail * sfs.f_frsize;
 
-        printf("rtty waiting to receive. Press Ctrl+C to cancel\n");
+            if (ctx->total_size > avail) {
+                log_err("download file fail: no enough space\n");
+                goto check_space_fail;
+            }
+        } else {
+            log_err("download file fail: not found mount point of '%s'\n", savepath);
+            goto check_space_fail;
+        }
     }
 
-    set_stdin(true);
+    buffer_pull(info, name, len - 4);
 
-    ev_io_init(&w, stdin_read_cb, STDIN_FILENO, EV_READ);
-    ev_io_start(loop, &w);
-    w.data = &tc;
-
-    rf_write(STDOUT_FILENO, magic, 3);
-
-    if (tc.mode == RF_SEND) {
-        uint8_t info[512] = {0x01};
-
-        ev_timer_init(&t, timer_cb, 0.01, 0.01);
-	    ev_timer_start(loop, &t);
-        t.data = &tc;
-
-        info[1] = strlen(bname);
-        memcpy(info + 2, bname, strlen(bname));
-        *(uint32_t *)&info[2 + strlen(bname)] = htonl(tc.size);
-
-        rf_write(STDOUT_FILENO, info, 6 + strlen(bname));
+    if (!access(savepath, F_OK)) {
+        send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_ERR_EXIST, NULL, 0);
+        log_err("the file '%s' already exists\n", name);
+        goto open_fail;
     }
 
-    ev_run(loop, 0);
+    fd = open(savepath, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+    if (fd < 0) {
+        send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_ERR, NULL, 0);
+        log_err("create file '%s' fail: %s\n", name, strerror(errno));
+        goto open_fail;
+    }
 
-    set_stdin(false);
+    log_info("download file: %s, size: %u\n", savepath, ctx->total_size);
 
-    exit(0);
+    if (fchown(fd, ctx->uid, ctx->gid) < 0)
+        log_err("fchown %s fail: %s\n", savepath, strerror(errno));
+
+    if (ctx->total_size == 0)
+        close(fd);
+    else
+        ctx->fd = fd;
+
+    memcpy(buf, &ctx->total_size, 4);
+    strcpy(buf + 4, name);
+
+    send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_INFO, buf, 4 + strlen(name));
+
+    return;
+
+check_space_fail:
+    send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_NO_SPACE, NULL, 0);
+    buffer_pull(info, NULL, len - 4);
+open_fail:
+    file_context_reset(ctx);
 }
 
+static void send_file_data_ack(struct tty *tty)
+{
+    struct rtty *rtty = tty->rtty;
+
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 33);
+    buffer_put_data(&rtty->wb, tty->sid, 32);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_ACK);
+    ev_io_start(rtty->loop, &rtty->iow);
+}
+
+void parse_file_msg(struct file_context *ctx, struct buffer *data, int len)
+{
+    struct tty *tty = container_of(ctx, struct tty, file);
+    int type = buffer_pull_u8(data);
+
+    len--;
+
+    switch (type) {
+    case RTTY_FILE_MSG_INFO:
+        start_download_file(ctx, data, len);
+        break;
+
+    case RTTY_FILE_MSG_DATA:
+        if (len > 0) {
+            if (ctx->fd > -1) {
+                buffer_pull_to_fd(data, ctx->fd, len);
+                ctx->remain_size -= len;
+
+                if (notify_progress(ctx) < 0) {
+                    file_context_reset(ctx);
+                } else {
+                    if (ctx->remain_size == 0)
+                        file_context_reset(ctx);
+                    else
+                        send_file_data_ack(tty);
+                }
+            } else {
+                buffer_pull(data, NULL, len);
+            }
+        } else {
+            file_context_reset(ctx);
+        }
+        break;
+
+    case RTTY_FILE_MSG_ACK:
+        send_file_data(ctx);
+        break;
+
+    case RTTY_FILE_MSG_ABORT:
+        send_file_control_msg(ctx->ctlfd, RTTY_FILE_CTL_ABORT, NULL, 0);
+        file_context_reset(ctx);
+        break;
+
+    default:
+        break;
+    }
+}

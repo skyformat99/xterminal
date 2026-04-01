@@ -1,55 +1,59 @@
 /*
- * Copyright (C) 2017 Jianhui Zhao <jianhuizhao329@gmail.com>
+ * MIT License
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
+ * Copyright (c) 2019 Jianhui Zhao <zhaojh329@gmail.com>
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
- * USA
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #ifndef _COMMAND_H
 #define _COMMAND_H
 
-#include <uwsc/uwsc.h>
-
-#include "json.h"
+#include "rtty.h"
 
 #define RTTY_CMD_MAX_RUNNING     5
-#define RTTY_CMD_EXEC_TIMEOUT    5
+#define RTTY_CMD_EXEC_TIMEOUT    30
 
 enum {
-	RTTY_CMD_ERR_PERMIT = 1,
-	RTTY_CMD_ERR_NOT_FOUND,
-	RTTY_CMD_ERR_NOMEM,
-	RTTY_CMD_ERR_SYSERR,
-	RTTY_CMD_ERR_RESP_TOOBIG
+    RTTY_CMD_ERR_PERMIT = 1,
+    RTTY_CMD_ERR_NOT_FOUND,
+    RTTY_CMD_ERR_NOMEM,
+    RTTY_CMD_ERR_SYSERR,
+    RTTY_CMD_ERR_RESP_TOOBIG
 };
 
 struct task {
     struct list_head list;
-    struct uwsc_client *ws;
+    struct rtty *rtty;
     struct ev_child cw;
     struct ev_timer timer;
     struct ev_io ioo;   /* Watch stdout of child */
     struct ev_io ioe;   /* Watch stderr of child */
     struct buffer ob;   /* buffer for stdout */
     struct buffer eb;   /* buffer for stderr */
-    const json_value *msg;  /* message from server */
-    const json_value *attrs;
-    int id;
+    uid_t uid;
+    int nparams;
+    char **params;
+    char token[33];
     char cmd[0];
 };
 
-void run_command(struct uwsc_client *ws, const json_value *msg);
+void run_command(struct rtty *rtty, const char *data);
 
 #endif

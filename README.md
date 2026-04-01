@@ -1,138 +1,150 @@
-# rtty([中文](/README_ZH.md))
+# rtty ([中文](/README_ZH.md)) - Access your device from anywhere via the web
 
-[1]: https://img.shields.io/badge/license-LGPL2-brightgreen.svg?style=plastic
+**This project is officially supported by [GL.iNet](https://www.gl-inet.com).**
+
+[1]: https://img.shields.io/badge/license-MIT-brightgreen.svg?style=plastic
 [2]: /LICENSE
 [3]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=plastic
 [4]: https://github.com/zhaojh329/rtty/pulls
 [5]: https://img.shields.io/badge/Issues-welcome-brightgreen.svg?style=plastic
 [6]: https://github.com/zhaojh329/rtty/issues/new
-[7]: https://img.shields.io/badge/release-6.4.1-blue.svg?style=plastic
+[7]: https://img.shields.io/badge/release-9.0.4-blue.svg?style=plastic
 [8]: https://github.com/zhaojh329/rtty/releases
-[9]: https://travis-ci.org/zhaojh329/rtty.svg?branch=master
-[10]: https://travis-ci.org/zhaojh329/rtty
+[9]: https://github.com/zhaojh329/rtty/workflows/build/badge.svg
+[10]: https://raw.githubusercontent.com/CodePhiliaX/resource-trusteeship/main/readmex.svg
+[11]: https://readmex.com/zhaojh329/rtty
+[12]: https://deepwiki.com/badge.svg
+[13]: https://deepwiki.com/zhaojh329/rtty
+[14]: https://img.shields.io/github/downloads/zhaojh329/rtty/total
 
 [![license][1]][2]
 [![PRs Welcome][3]][4]
 [![Issue Welcome][5]][6]
 [![Release Version][7]][8]
-[![Build Status][9]][10]
+![Build Status][9]
+![Downloads][14]
+[![ReadmeX][10]][11]
+[![Ask DeepWiki][12]][13]
+![visitors](https://visitor-badge.laobi.icu/badge?page_id=zhaojh329.rtty)
 
 [Xterm.js]: https://github.com/xtermjs/xterm.js
-[lrzsz]: https://ohse.de/uwe/software/lrzsz.html
 [libev]: http://software.schmorp.de/pkg/libev.html
-[libuwsc]: https://github.com/zhaojh329/libuwsc
 [openssl]: https://github.com/openssl/openssl
 [mbedtls(polarssl)]: https://github.com/ARMmbed/mbedtls
 [CyaSSl(wolfssl)]: https://github.com/wolfSSL/wolfssl
 [vue]: https://github.com/vuejs/vue
-[iview]: https://github.com/iview/iview
 [server]: https://github.com/zhaojh329/rttys
 
-![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/screen.gif)
-![](https://raw.githubusercontent.com/zhaojh329/rtty/doc/file.gif)
+## Architecture
 
-It is composed of a client and a [server]. The client is written in pure C. The [server] is written in go language
-and the front-end interface is written in [iview] & [Vue].
+```mermaid
+flowchart TB
+s[rttys with public IP address]
+u1["User (Web Browser)"] --> s
+u2["User (Web Browser)"] --> s
+u3["User (Web Browser)"] --> s
+s --> c1["rtty (Linux Device)"]
+s --> c2["rtty (Linux Device)"]
+s --> c3["rtty (Linux Device)"]
+```
 
-You can access your terminals from anywhere via the web. Differentiate your different terminals by device ID(If
-the ID is not set, the MAC address of your device is used).
+![](/img/terminal.gif)
+![](/img/file.gif)
+![](/img/web.gif)
+![](/img/virtual-keyboard.jpg)
 
-rtty is very suitable for remote maintenance your or your company's thousands of Linux devices deployed around
-the world.
+## Overview
 
-# Features
-* Simple to deployment and easy to use
-* Access different devices based on device ID
-* Provide a dashboard to visualize online devices
-* Fully-featured terminal based on [Xterm.js]
-* Support transfer file
-* SSL support: openssl, mbedtls, CyaSSl(wolfssl)
-* Support Execute a command remote
-* The client is very small, suitable for embedded Linux: rtty(20.1K) + libev(48.5K) + libuwsc(24.4K) + libwolfssl(595.9K) = 688.9K
+rtty is a powerful remote terminal solution composed of clients and a [server].
 
-# Dependencies of the Client side
-* [libev] - A full-featured and high-performance event loop
-* [libuwsc] - A Lightweight and fully asynchronous WebSocket client library based on libev
-* [mbedtls(polarssl)], [CyaSSl(wolfssl)] or [openssl] - If you want to support SSL
+**Client Implementations:**
+- **C Client:** Ultra-lightweight, designed for embedded Linux and resource-constrained devices.
+- **Go Client:** Easy cross-platform compilation, suitable for rapid integration and cloud-native/container environments.
 
-# [Deploying the server side](https://github.com/zhaojh329/rttys)
+The server is implemented in Go, with a modern frontend built using [Vue].
 
-# How to install and run the Client - rtty
-## For Linux distribution: Ubuntu, Debian, ArchLinux, Centos
-Install
+You can access your device from anywhere via a web browser, and manage devices using unique device IDs.
 
-    wget -qO- https://raw.githubusercontent.com/zhaojh329/rtty/master/tools/install.sh | sudo bash
+rtty is ideal for remote maintenance and management of large-scale distributed Linux devices, making it a great choice for enterprise operations.
 
-Command-line Options
+**Go client repository:** [https://github.com/zhaojh329/rtty-go](https://github.com/zhaojh329/rtty-go)
 
-    Usage: rtty [option]
-      -i ifname    # Network interface name - Using the MAC address of
-                          the interface as the device ID
-      -I id        # Set an ID for the device(Maximum 63 bytes, valid character:letters
-                          and numbers and underlines and short lines) - If set,
-                          it will cover the MAC address(if you have specify the ifname)
-      -h host      # Server host
-      -p port      # Server port
-      -a           # Auto reconnect to the server
-      -v           # verbose
-      -d           # Adding a description to the device(Maximum 126 bytes)
-      -s           # SSL on
-      -k keepalive # keep alive in seconds for this client. Defaults to 5
-      -V           # Show version
-      -D           # Run in the background
+## Key Features
 
-Run RTTY(Replace the following parameters with your own parameters)
+### 🚀 **Multi-language Client Options**
+- **C Client:**
+  - Ultra-lightweight, designed for embedded Linux and resource-constrained devices
+  - Minimal footprint (without SSL: rtty 32KB + libev 56KB; with SSL: + libmbedtls 88KB + libmbedcrypto 241KB + libmbedx509 48KB)
+  - Multiple SSL backends (OpenSSL, mbedtls, CyaSSl/wolfssl)
+  - mTLS support for mutual authentication
 
-    sudo rtty -I 'My-device-ID' -h 'your-server' -p 5912 -a -v -s -d 'My Device Description'
+- **Go Client:**
+  - Easy cross-platform compilation, suitable for rapid integration and cloud/container environments
+  - Minimal dependencies, simple deployment
+  - It has the same functions as the C client and is fully compatible.
 
-## [For OpenWRT](/OPENWRT.md)
+### 🔐 **Security**
+- Multiple SSL backends and mutual authentication for secure data transfer
 
-## [For Other Embedded Linux Platform](/CROSS_COMPILE.md)
+### 🌐 **Advanced Remote Management**
+- Batch command execution across multiple devices
+- Device identification using unique device IDs
+- HTTP Proxy support for accessing device web interfaces
 
-# Usage
-Use your web browser to access your server: `https://your-server-host:5912`, then click the connection button
+### 📁 **File Management**
+- Seamless file transfer: convenient upload and download
+- Web-based interface for intuitive file operations
 
-You can easily embed RTTY into your existing platform: `https://your-server-host:5912/#/?id=your-id`
+### 💻 **Modern Terminal Experience**
+- Full-featured terminal powered by [Xterm.js]
+- Browser-based access from anywhere
+- Virtual keyboard support for touch devices
+- Window splitting for multi-session and multitasking
 
-Automatic login: `https://your-server:5912/#/?id=device-id&username=device-username&password=device-password`
+### ⚡ **Deployment & Compatibility**
+- Simple deployment and quick setup
+- Easy-to-use interface
+- Cross-platform compatibility
 
-## Transfer file
-Transfer file from local to remote device
+### ⚡ **Deployment & Usability**
+- **Simple deployment** process
+- **Easy to use** interface
+- **Cross-platform compatibility**
 
-	rtty -R
+## Production Users
 
-Transfer file from remote device to the local
+Trusted by leading technology companies:
 
-	rtty -S test.txt
-
-## Execute a command remote
-### Shell
-
-    curl -k https://your-server:5912/cmd -d '{"devid":"test","username":"test","password":"123456","cmd":"ls","params":["/"],"env":{}}'
-
-    {"Err":0,"msg":"","code":0,"stdout":"bin\ndev\netc\nlib\nmnt\noverlay\nproc\nrom\nroot\nsbin\nsys\ntmp\nusr\nvar\nwww\n","stderr":""}
-
-### Jquery
-
-    var data = {devid: 'test', username: 'test', password: '123456', cmd: 'ls', params: ['/'], env: {}};
-    $.post('https://your-server:5912/cmd', JSON.stringify(data), function(r) {console.log(r)});
+- **[GL.iNet](https://www.gl-inet.com/)**
+- **[Yunlianxin Technology](http://www.iyunlink.com/)**
+- **[One IOT World](https://www.oneiotworld.com/)**
+- **[bitswrt Communication Technology](http://bitswrt.com/)**
+- **[Guangzhou Lingpai Technology](https://linkpi.cn/)**
+- *...and many more*
 
 
-### Axios
+## Client Dependencies
 
-    var data = {devid: 'test', username: 'test', password: '123456', cmd: 'ls', params: ['/'], env: {}};
-    axios.post('https://your-server:5912/cmd', JSON.stringify(data)).then(function (response) {
-        console.log(response.data);
-    }).catch(function (error) {
-        console.log(error);
-    });
+### C Client Dependencies
+- **Required:**
+  - [libev] - High-performance event loop library
+  - [inih](https://github.com/benhoyt/inih) - Lightweight INI parser for loading rtty config file
+- **Optional (for SSL support):**
+  - [mbedtls(polarssl)] - Lightweight SSL/TLS library
+  - [CyaSSl(wolfssl)] - Embedded SSL/TLS library
+  - [openssl] - Full-featured SSL/TLS toolkit
 
-# [Donate](https://gitee.com/zhaojh329/rtty#project-donate-overview)
+### Go Client Dependencies
+- No extra dependencies. Pure Go build and runtime.
 
-# Contributing
-If you would like to help making [rtty](https://github.com/zhaojh329/rtty) better,
-see the [CONTRIBUTING.md](https://github.com/zhaojh329/rtty/blob/master/CONTRIBUTING.md) file.
+## ⭐ Star History
 
-# QQ group: 153530783
+[![Star History Chart](https://api.star-history.com/svg?repos=zhaojh329/rtty&type=Date)](https://www.star-history.com/#zhaojh329/rtty&Date)
 
-# If the project is helpful to you, please do not hesitate to star. Thank you!
+## 🤝 Contributing
+
+Help us make [rtty](https://github.com/zhaojh329/rtty) even better!
+
+See the [CONTRIBUTING.md](https://github.com/zhaojh329/rtty/blob/master/CONTRIBUTING.md) file for detailed guidelines on how to contribute to this project.
+
+## ❤️ [Donation](https://zhaojh329.github.io/zhaojh329/)
